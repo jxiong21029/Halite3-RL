@@ -1,31 +1,16 @@
 import copy
+import random
 from dataclasses import dataclass
 
 from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
 from bot_fast import FastBot
 from engine import Game
 from entity import Position, Shipyard, MoveCommand, SpawnShipCommand
-
-
-class QNet(nn.Module):
-    def __init__(self):
-        super(QNet, self).__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(in_channels=10, out_channels=32, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
-            nn.BatchNorm2d(32),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
-            nn.BatchNorm2d(32),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=32, out_channels=5, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
-        ).float()
-
-    def forward(self, x):
-        return self.model.forward(x)
 
 
 @dataclass
@@ -37,7 +22,7 @@ class Transition:
 
 
 def extract_features(game, my_id) -> np.ndarray:
-    cell_features = np.zeros(shape=(10, game.size, game.size), dtype=np.float32)
+    cell_features = np.zeros(shape=(11, game.size, game.size), dtype=np.float32)
     # Feature 0: cell halite
     np.copyto(dst=cell_features[0, :, :], src=game.cells[:, :, 0] / 1000)
     for ship in game.ships.values():
@@ -66,64 +51,90 @@ def extract_features(game, my_id) -> np.ndarray:
             else:
                 # Feature 8 - has enemy dropoff - bool
                 cell_features[8, constr.y, constr.x] = 1
-    # Feature 9 - turns left after returning to nearest dropoff - normalized
+    # Feature 9 - distance to nearest dropoff - normalized
     for y in range(game.size):
         for x in range(game.size):
             nearest_dist = min(game.size - abs(game.size // 2 - abs(constr.y - y)) - abs(
-                                    game.size // 2 - abs(constr.x - x))
+                game.size // 2 - abs(constr.x - x))
                                for constr in game.constructs.values()
                                if constr.owner_id == my_id)
-            cell_features[9, y, x] = (game.max_turns - game.turn - nearest_dist + 64) / 564
+            cell_features[9, y, x] = nearest_dist / 32
+    # Feature 10 - turns left - normalized
+    cell_features[10] = (game.max_turns - game.turn) / 500
     return cell_features
 
 
-class ReplayMemory:
-    def __init__(self, size):
+class ReplayMemory(Dataset):
+    def __init__(self, size, device):
         self.size = size
-        self.features = torch.zeros(size=(size, 10, 64, 64), dtype=torch.float32)
-        self.actions = torch.zeros(size=(size, 64, 64), dtype=torch.int64)
-        self.rewards = torch.zeros(size=(size, 64, 64), dtype=torch.float32)
-        self.next_features = torch.zeros(size=(size, 10, 64, 64), dtype=torch.float32)
-        self.terminal = torch.zeros(size=(size,), dtype=torch.bool)
+        self.features = torch.zeros(size=(size, 11, 64, 64), dtype=torch.float32, device=device)
+        self.actions = torch.zeros(size=(size, 64, 64), dtype=torch.int64, device=device)
+        self.rewards = torch.zeros(size=(size, 64, 64), dtype=torch.float32, device=device)
+        self.next_features = torch.zeros(size=(size, 11, 64, 64), dtype=torch.float32, device=device)
+        self.terminal = torch.zeros(size=(size,), dtype=torch.bool, device=device)
         self.num_entries = 0
         self._idx = 0
 
-    def add_sample(self, new_features, new_actions, new_rewards, new_next_features, terminal=False):
-        self.features[self._idx] = torch.tile(torch.as_tensor(new_features, dtype=torch.float32), (2, 2))[:, :64, :64]
+    def add_sample(self, new_feat, new_actions, new_rewards, new_next_feat, terminal=False):
+        self.features[self._idx] = torch.tile(torch.as_tensor(new_feat, dtype=torch.float32), (2, 2))[:, :64, :64]
         self.actions[self._idx] = torch.tile(torch.as_tensor(new_actions, dtype=torch.int64), (2, 2))[:64, :64]
         self.rewards[self._idx] = torch.tile(torch.as_tensor(new_rewards, dtype=torch.float32), (2, 2))[:64, :64]
         self.next_features[self._idx] = torch.tile(torch.as_tensor(
-            new_next_features, dtype=torch.float32), (2, 2))[:, :64, :64]
+            new_next_feat, dtype=torch.float32), (2, 2))[:, :64, :64]
         self.terminal[self._idx] = terminal
 
         self._idx = (self._idx + 1) % self.size
         if self.num_entries < self.size:
             self.num_entries += 1
 
-    def sample(self, batch_size):
-        if self.num_entries < batch_size:
-            raise ValueError(f'Cannot sample a batch of {batch_size} from a dataset of {self.num_entries} entries')
-        idxs = np.random.choice(np.arange(self.num_entries), size=batch_size)
-        return (self.features[idxs], self.actions[idxs], self.rewards[idxs], self.next_features[idxs],
-                self.terminal[idxs])
+    def __getitem__(self, item):
+        return (self.features[item], self.actions[item], self.rewards[item], self.next_features[item],
+                self.terminal[item])
+
+    def __len__(self):
+        return self.num_entries
+
+
+class QNet(nn.Module):
+    def __init__(self):
+        super(QNet, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(in_channels=11, out_channels=32, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=32, out_channels=5, kernel_size=(3, 3), padding=(1, 1), padding_mode='circular'),
+        ).float()
+
+    def forward(self, x):
+        return self.model.forward(x)
 
 
 class QNetBot:
-    def __init__(self, my_id, model: QNet):
+    def __init__(self, my_id, model, device_):
         self.id = my_id
         self.model = model
         self.shipyard = None
         self.map_starting_halite = None
         self.halite = None
+        self.device = device_
 
-    def generate_commands(self, game):
+    def generate_commands(self, game, eps=0):
         if self.shipyard is None:
             for shipyard in game.constructs.values():
                 if shipyard.owner_id == self.id:
                     self.shipyard = shipyard
                     break
             self.map_starting_halite = np.sum(game.cells[:, :, 0])
-        features = torch.from_numpy(extract_features(game, self.id)).float().to(device)
+        if self.device is not None:
+            features = torch.from_numpy(extract_features(game, self.id)).float().to(self.device)
+        else:
+            features = torch.from_numpy(extract_features(game, self.id)).float()
         # print(features.unsqueeze(0).shape)
         self.model.eval()
         q_values = self.model.forward(features.unsqueeze(0))
@@ -140,10 +151,15 @@ class QNetBot:
                 next_ships[y].append([])
         for ship in game.ships.values():
             if ship.owner_id == self.id:
-                greedy_action = torch.max(q_values[0, :, ship.y, ship.x], dim=0)[1].item()
-                if greedy_action != 0:
+                if ship.halite < game.cells[ship.y][ship.x][0] // 10:
+                    eps_greedy_action = 0
+                elif random.random() < eps:
+                    eps_greedy_action = random.randint(0, 4)
+                else:
+                    eps_greedy_action = torch.max(q_values[0, :, ship.y, ship.x], dim=0)[1].item()
+                if eps_greedy_action != 0:
                     queue.append(ship)
-                direction = 'ONESW'[greedy_action]
+                direction = 'ONESW'[eps_greedy_action]
                 new_command = MoveCommand(ship.id, direction)
                 commands[ship.id] = new_command
                 next_pos[ship.id] = (ship.pos + new_command.direction_vector)
@@ -190,54 +206,81 @@ class QNetBot:
         return ret
 
 
-def evaluate_performance():
+def evaluate_performance(model, device_, seeds=None):
     import time
-    seeds = [491777, 221533, 427817, 849970, 230048, 208860, 253589, 794821, 106587, 659861]
+    if seeds is None:
+        seeds = [491777, 221533, 427817, 849970, 230048, 208860, 253589, 794821, 106587, 659861]
     wins_count = 0
+    ship_counts = []
+    banks = []
     bank_ratios = []
     for seed in tqdm(seeds, desc='Evaluating Performance'):
         current_game = Game(2, size=64, seed=seed)
-        rl_bot, opp_fastbot = QNetBot(0, q_network), FastBot(1)
+        rl_bot, opp_fastbot = QNetBot(0, model, device_), FastBot(1)
+        ships_set = set()
         for current_t in range(current_game.max_turns):
-            current_game.step([rl_bot.generate_commands(current_game), opp_fastbot.generate_commands(current_game)])
+            current_game.step([rl_bot.generate_commands(current_game),
+                               opp_fastbot.generate_commands(current_game)])
+            for s in current_game.ships.values():
+                if s.owner_id == 0:
+                    ships_set.add(s.id)
+        ship_counts.append(len(ships_set))
         if current_game.winner_id == 0:
             wins_count += 1
+        banks.append(current_game.banks[0])
         bank_ratios.append(current_game.banks[0] / current_game.banks[1])
     time.sleep(1)
-    print(f'Winrate: {wins_count * 100 // len(seeds)}%')
-    time.sleep(0.4)
-    print(f'On average, the RL bot\'s bank is {100 * sum(bank_ratios) / len(seeds):.1f}% the size of FastBot\'s')
+    print(f'Winrate: {wins_count * 100 // len(seeds)}% -- Mean Ships: {sum(ship_counts) / len(seeds)} -- Max Ships: '
+          f'{max(ship_counts)} -- Mean Bank: {sum(banks) / len(seeds)} -- Max Bank: {max(banks)}')
     time.sleep(1)
 
 
 TRAIN_START_THRESH = 1000
+TURNS_PER_EP = 100
 BATCH_SIZE = 32
 DISCOUNT_FACTOR = 0.99
-LEARNING_RATE = 0.01
+LEARNING_RATE = 1e-4
+EPS_HI = 1
+EPS_LO = .05
+EPS_DECAY = 0.995
 
 if __name__ == '__main__':
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device}')
+    my_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    replay_memory = ReplayMemory(10000)
-    q_network = QNet()
+    replay_memory = ReplayMemory(2000, my_device)
+    # q_network = lraspp_mobilenet_v3_large(pretrained=False, num_classes=5, pretrained_backbone=False)
+    # TODO: q_network = QNet()
+    q_network = torch.nn.Conv2d(
+        in_channels=11, out_channels=5, kernel_size=(7, 7), padding=(3, 3), padding_mode='circular'
+    )
     frozen_q = copy.deepcopy(q_network)
-    q_network.to(device)
-    frozen_q.to(device)
+    q_network.to(my_device)
+    frozen_q.to(my_device)
+
+    dataloader = None
+    # loss_fn = torch.nn.SmoothL1Loss()
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.RMSprop(q_network.parameters(), lr=LEARNING_RATE)
     for ep in range(1000):
-        g = Game(num_players=2, size=64)
-        teacher_bot = FastBot(player_id=0, eps=0.1)
+        g = Game(num_players=2, size=64, max_turns=TURNS_PER_EP, seed=221533)
+        cur_rl_bot = QNetBot(0, q_network, my_device)
         opponent_bot = FastBot(player_id=1)
 
-        for t in tqdm(range(g.max_turns), desc=f'Episode {ep:03}'):
+        tot_mined = 0
+        if ep >= TRAIN_START_THRESH / TURNS_PER_EP:
+            cur_eps = (EPS_HI - EPS_LO) * (EPS_DECAY ** (ep - TRAIN_START_THRESH / TURNS_PER_EP)) + EPS_LO
+        else:
+            cur_eps = 1
+        # for t in tqdm(range(g.max_turns), desc=f'Episode {ep:03}'):
+        for t in range(g.max_turns):
             current_features = extract_features(g, 0)
 
-            teacher_commands = teacher_bot.generate_commands(g)
+            rl_bot_commands = cur_rl_bot.generate_commands(g, eps=cur_eps)
 
             actions_arr = np.full(shape=(g.size, g.size), fill_value=-1)  # 0O 1N 2E 3S 4W
             rewards_arr = np.zeros(shape=(g.size, g.size))
             unprocessed_ships = set(ship.id for ship in g.ships.values() if ship.owner_id == 0)
-            for action in teacher_commands:
+            for action in rl_bot_commands:
                 if not isinstance(action, MoveCommand):
                     continue
                 ship = g.ships[action.target_id]
@@ -253,59 +296,59 @@ if __name__ == '__main__':
                 resulting_pos = ship.pos + action.direction_vector
                 for construct in g.constructs.values():
                     if construct.owner_id == 0 and resulting_pos == construct.pos:
+                        tot_mined += ship.halite
                         rewards_arr[ship.y, ship.x] = ship.halite / 100
             for ship_id in unprocessed_ships:
                 actions_arr[g.ships[ship_id].y, g.ships[ship_id].x] = 0
 
-            g.step([teacher_commands, opponent_bot.generate_commands(g)])
+            g.step([rl_bot_commands, opponent_bot.generate_commands(g)])
 
             is_terminal = False
             if not g.done:
                 next_features = extract_features(g, 0)
             else:
                 is_terminal = True
-                next_features = np.full(shape=(10, 64, 64), fill_value=-1)
+                next_features = np.full(shape=(11, 64, 64), fill_value=-1)
 
             if not is_terminal:
                 replay_memory.add_sample(current_features, actions_arr, rewards_arr, next_features)
             else:
                 replay_memory.add_sample(current_features, actions_arr, rewards_arr, next_features, terminal=True)
+            if len(replay_memory) == TRAIN_START_THRESH:
+                dataloader = DataLoader(replay_memory, batch_size=32, shuffle=True, pin_memory=False)
 
             if replay_memory.num_entries >= TRAIN_START_THRESH:
-                batch_feat, batch_actions, batch_rewards, batch_nextfeat, batch_term = replay_memory.sample(BATCH_SIZE)
-                batch_feat = batch_feat.to(device)
-                batch_actions = batch_actions.to(device)
-                batch_rewards = batch_rewards.to(device)
-                batch_nextfeat = batch_nextfeat.to(device)
-                batch_actions[batch_actions == -1] = 0
-                q_prediction = q_network.forward(batch_feat).gather(1, batch_actions.unsqueeze(1)).squeeze()
-                expected_return = frozen_q.forward(batch_nextfeat)
-                q_target = torch.clone(batch_rewards)
-                for action, disp in enumerate(((0, 0), (1, 0), (0, 1), (-1, 0), (0, -1))):
-                    mask = batch_actions[~batch_term] == action
-                    q_target[~batch_term][mask] += DISCOUNT_FACTOR * (
-                        # gamma * maxQ' term
-                        torch.max(expected_return.roll((-disp[0], -disp[1]), (2, 3)), 1).values[~batch_term][mask]
-                        # zeros out return for dead ships
-                        * (batch_nextfeat.roll((-disp[0], -disp[1]), (2, 3))[:, 1, :, :][~batch_term][mask] == 1)
-                    )
-                criterion = torch.nn.MSELoss()
-                loss = criterion(q_prediction[batch_feat[:, 1] == 1], q_target[batch_feat[:, 1] == 1])
-                # loss = (q_target - q_prediction)[batch_feat[:, 1] == 1].pow(2).sum()
-                # print('Loss: ', loss)
-                q_network.zero_grad()
-                loss.backward()
-                with torch.no_grad():
-                    for param in q_network.parameters():
-                        param -= LEARNING_RATE * param.grad
-                        # print(param.grad)
+                b_feat, b_actions, b_rewards, b_nextfeat, b_term = next(iter(dataloader))
+                b_feat = b_feat
+                b_actions = b_actions
+                b_rewards = b_rewards
+                b_nextfeat = b_nextfeat
+                b_actions[b_actions == -1] = 0
 
-            # TODO
-            #   Make mapgen deterministic (seeded) in order to create an effective validation dataset
+                q_prediction = q_network.forward(b_feat).gather(1, b_actions.unsqueeze(1)).squeeze()
+                expected_return = frozen_q.forward(b_nextfeat)
+                q_target = torch.clone(b_rewards)
+                for action, disp in enumerate(((0, 0), (1, 0), (0, 1), (-1, 0), (0, -1))):
+                    mask = b_actions[~b_term] == action
+                    temp = q_target[~b_term]
+                    temp[mask] += DISCOUNT_FACTOR * (
+                        # gamma * maxQ' term
+                        torch.max(expected_return.roll((-disp[0], -disp[1]), (2, 3)), 1).values[~b_term][mask]
+                        # zeros out return for dead ships
+                        * (b_nextfeat.roll((-disp[0], -disp[1]), (2, 3))[~b_term][:, 1, :, :][mask] == 1)
+                    )
+                    q_target[~b_term] = temp
+                loss = loss_fn(q_prediction[b_feat[:, 1] == 1], q_target[b_feat[:, 1] == 1].cuda())
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+        if next(q_network.parameters()).isnan().any().item():
+            raise OverflowError('Model parameters contain nan')
+
+        print(f'Episode {ep: 3d} -- Total halite mined: {tot_mined:4d} -- Epsilon: {cur_eps:.3f}')
 
         if ep % 10 == 9:
             frozen_q = copy.deepcopy(q_network)
-        if ep % 20 == 0:
-            evaluate_performance()
-        if ep % 200 == 199:
-            torch.save(q_network.state_dict(), f'conv_dqn_obsL_{ep + 1}.pt')
+        if ep % 100 == 99:
+            torch.save(q_network.state_dict(), f'checkpoints/f50-dqn-linear-{ep + 1}.pt')
