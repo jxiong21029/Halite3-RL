@@ -1,11 +1,11 @@
-import math
 from collections import defaultdict
-from viewer import Replay
+import math
 from typing import Dict
 
 import numpy as np
 
 from entity import Position, Entity, Ship, Shipyard, Dropoff, MoveCommand, SpawnShipCommand, ConstructDropoffCommand
+from viewer import Replay
 
 
 def _fade(t):
@@ -76,7 +76,7 @@ def center(pos, cent, w, h):
 
 
 class Game:
-    def __init__(self, num_players: int, size: int = None, create_replay=False, seed=None):
+    def __init__(self, num_players: int, size=None, max_turns=None, create_replay=False, seed=None):
         if num_players not in (2, 4):
             raise ValueError(f'Standard games can only support either 2 or 4 players')
         self.num_players = num_players
@@ -87,7 +87,10 @@ class Game:
             size = rng.choice((32, 40, 48, 56, 64))
         self.size = size
         self.turn = 0
-        self.max_turns = round(self.size * 3.125) + 300
+        if max_turns is None:
+            self.max_turns = round(self.size * 3.125) + 300
+        else:
+            self.max_turns = max_turns
 
         self.constructs: Dict[int, Entity] = {}
         self.ships: Dict[int, Ship] = {}
