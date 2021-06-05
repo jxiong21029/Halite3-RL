@@ -1,29 +1,29 @@
+from collections import defaultdict
 import random
 
 import numpy as np
 
-from collections import defaultdict
 from engine import Game
 from entity import Position, MoveCommand, SpawnShipCommand
 
 
-class FastBot:
-    def __init__(self, player_id, eps=0.0):
+class SimpleBot:
+    def __init__(self, player_id):
         self.id = player_id
         self.shipyard = None
         self.halite = 0
         self.returning = defaultdict(bool)  # ship id: bool
         self.map_starting_halite = None
-        self.eps = eps
+        self.rand_modifier = random.randint(0, 3)
 
-    def generate_commands(self, game):
+    def generate_commands(self, game, eps=0):
         if self.shipyard is None:
             for shipyard in game.constructs.values():
                 if shipyard.owner_id == self.id:
                     self.shipyard = shipyard
                     break
             self.map_starting_halite = np.sum(game.cells[:, :, 0])
-            
+
         def dist(a, b):
             return min(abs(a.x - b.x), game.size - abs(a.x - b.x)) + min(abs(a.y - b.y), game.size - abs(a.y - b.y))
         commands = {}
@@ -40,7 +40,7 @@ class FastBot:
             if ship.owner_id == self.id:
                 if (
                         ship.halite > 950
-                        or game.turn + dist(ship, self.shipyard) + min(20, (game.max_turns // 10) + 1) > game.max_turns
+                        or game.turn + dist(ship, self.shipyard) + 15 > game.max_turns
                 ):
                     self.returning[ship.id] = True
                 elif ship.x == self.shipyard.x and ship.y == self.shipyard.y:
@@ -48,8 +48,14 @@ class FastBot:
                 if ship.halite < game.cells[ship.y][ship.x][0] // 10:
                     next_pos[ship.id] = Position(ship.x, ship.y)
                 else:
-                    if random.random() < self.eps:
-                        target = Position(random.randint(0, game.size), random.randint(0, game.size))
+                    if random.random() < eps:
+                        target = random.choice([
+                            Position(ship.x, ship.y),
+                            Position(ship.x + 1, ship.y),
+                            Position(ship.x - 1, ship.y),
+                            Position(ship.x, ship.y + 1),
+                            Position(ship.x, ship.y - 1)
+                        ])
                     elif self.returning[ship.id]:
                         target = Position(self.shipyard.x, self.shipyard.y)
                     else:
@@ -57,8 +63,16 @@ class FastBot:
                         for dx in range(-2, 3):
                             for dy in range(-2, 3):
                                 p = Position((ship.x + dx) % game.size, (ship.y + dy) % game.size)
-                                if (game.cells[p.y][p.x][0]) / (dist(ship, p) + 1) > game.cells[target.y][target.x][0] / (dist(target, ship) + 1):
+                                if (game.cells[p.y, p.x, 0]) / (dist(ship, p) + 1) \
+                                        > game.cells[target.y, target.x, 0] / (dist(target, ship) + 1):
                                     target = p
+                        if game.cells[target.y, target.x, 0] == 0:
+                            target = [
+                                Position(ship.x + 1, ship.y),
+                                Position(ship.x - 1, ship.y),
+                                Position(ship.x, ship.y + 1),
+                                Position(ship.x, ship.y - 1)
+                            ][(ship.id + self.rand_modifier) % 4]
                     xdl = (ship.x - target.x) % game.size
                     xdr = (target.x - ship.x) % game.size
                     ydd = (ship.y - target.y) % game.size
@@ -130,7 +144,8 @@ class FastBot:
             ship = q.pop()
             nx = next_pos[ship.id].x
             ny = next_pos[ship.id].y
-            if len(next_ships[ny][nx]) > 1 and not (turns_left <= 50 and nx == self.shipyard.x and ny == self.shipyard.y):
+            if len(next_ships[ny][nx]) > 1 and not (
+                    turns_left <= 25 and nx == self.shipyard.x and ny == self.shipyard.y):
                 cur = Position(ship.x, ship.y)
                 done = False
                 visited = set()
@@ -166,11 +181,22 @@ class FastBot:
         return ret
 
     def __repr__(self):
-        return f'FastBot(eps={self.eps})'
+        return f'SimpleBot(id={self.id})'
 
 
 if __name__ == '__main__':
-    g = Game(num_players=2, size=64, create_replay=True)
-    bot0, bot1 = FastBot(player_id=0, eps=0), FastBot(player_id=1, eps=0.1)
-    for turn in range(g.max_turns):
-        g.step([bot0.generate_commands(g), bot1.generate_commands(g)])
+    # [491777, 221533, 427817, 849970, 230048, 208860, 253589, 794821, 106587, 659861]
+    # g = Game(num_players=2, size=64, max_turns=50, create_replay=True, seed=221533)
+    # bot0, bot1 = SimpleBot(player_id=0, eps=0), SimpleBot(player_id=1, eps=0)
+    # for turn in range(g.max_turns):
+    #     g.step([bot0.generate_commands(g), bot1.generate_commands(g)])
+
+    from tqdm import tqdm
+    total = 0
+    for _ in tqdm(range(100)):
+        g = Game(num_players=2, size=64, max_turns=50, seed=221533)
+        bot0, bot1 = SimpleBot(player_id=0), SimpleBot(player_id=1)
+        for turn in range(g.max_turns):
+            g.step([bot0.generate_commands(g), bot1.generate_commands(g)])
+        total += sum(g.banks)
+    print(total / 200)
